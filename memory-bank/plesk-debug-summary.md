@@ -1,74 +1,51 @@
 # Plesk Next.js Monorepo Deployment Debug Summary
 
-## What We Tried
+**Last Updated:** June 19, 2025
 
-1. **Plesk Git Integration & Node.js Setup**
-   - Repo cloned and dependencies installed via Plesk UI.
-   - Node.js version and environment variables set via Plesk.
-
-2. **Build Process**
-   - Overcame monorepo and `pnpm` issues by:
-     - Adding `pnpm` as a dev dependency.
-     - Updating build scripts to use `npx pnpm install` and `npx turbo run build`.
-   - Build now completes successfully in Plesk.
-
-3. **Clerk/Authentication Issues**
-   - Temporarily removed all Clerk-related providers and components to avoid build/runtime errors due to missing environment variables.
-
-4. **API/Database Issues**
-   - Commented out API calls and provided dummy values for `DATABASE_URL` and `NEXT_PUBLIC_API_URL` to avoid runtime crashes.
-
-5. **Application Startup**
-   - Tried every possible combination for the Plesk "Application Startup File":
-     - `node_modules/.bin/turbo` (with and without turbo.json tweaks)
-     - `npm` (Plesk does not accept this as a file)
-     - Custom wrapper scripts (`start-plesk.sh`) using:
-       - `npx turbo run start --filter=web`
-       - `pnpm --filter=web start`
-       - `npx next start`
-       - `./node_modules/.bin/next start`
-   - All attempts resulted in Passenger reporting "application process exited prematurely" and Apache reporting "internal redirect" errors.
-
-6. **SSH Debugging**
-   - SSH shell is extremely minimal: no `node`, `npx`, `sed`, `dirname`, or other basic Unix utilities.
-   - Cannot run or debug Node.js apps via SSH on this host.
+This document summarizes the definitive findings from a deep debugging session aimed at deploying a pnpm/Turborepo monorepo Next.js application to a Plesk hosting environment.
 
 ---
 
-## What We Know Does NOT Work
+## Final Diagnosis & Core Issues
 
-- Any startup file that is not an actual file (e.g., `npm`).
-- Any script that relies on `node`, `npx`, or `pnpm` being available in the shell PATH.
-- Any script that relies on basic Unix utilities (`dirname`, `sed`, etc.).
-- Running Next.js via `./node_modules/.bin/next start` fails due to missing `node` in the shell PATH.
-- The Plesk/Passenger environment is too minimal for custom scripts unless all dependencies (including Node.js itself) are available in the PATH.
+The deployment failed due to a cascade of distinct issues, each of which needed to be solved in sequence.
+
+### 1. Application Portability (The Symlink Problem)
+
+-   **Problem:** Standard deployment methods (`pnpm deploy`, `next build --standalone`) for a pnpm monorepo create a `node_modules` directory containing symbolic links, which are not portable and break when uploaded to a server.
+-   **Evidence:** A local `find . -type l` command on the deployment package revealed hundreds of symlinks.
+-   **Solution:** The only reliable method to create a portable package was to use `tar` with the dereference flag (`-h`) to create a compressed archive. This follows all symlinks and archives the actual file contents, resulting in a self-contained `node_modules` directory.
+    -   **Command:** `tar -czhf deployment.tar.gz -C ../deploy_output_web .`
+
+### 2. Server Environment Configuration
+
+-   **Problem:** After uploading a correct package, a series of server-side errors occurred.
+-   **Sequence of Errors & Fixes:**
+    1.  **Apache Permissions:** `Permission Denied` errors on `.htaccess` were solved by setting directory permissions to `755`.
+    2.  **Node.js Permissions:** `Cannot find module` errors from within Next.js were solved by setting file permissions to `644`.
+    3.  **Plesk Application Root:** A persistent `internal redirect` loop was discovered to be caused by an incorrect **Application Root** path in the Plesk Node.js Toolkit UI. Correcting this was a major breakthrough.
+
+### 3. Application Startup & CJS/ESM Conflict
+
+-   **Problem:** With the environment fixed, the Node.js process still failed, crashing with an `ERR_REQUIRE_ESM` error.
+-   **Cause:** The Plesk/Passenger environment attempts to start the application using `require()` (CommonJS), but the Next.js `server.js` is an ES Module.
+-   **Solution:** A custom startup script (`plesk-start.cjs`) was created to solve this. The final, working version performs two critical functions:
+    1.  `process.chdir()`: Changes the current working directory to the location of the `server.js` file.
+    2.  `import()`: Uses a dynamic `import()` to correctly load the ES Module `server.js` file.
+
+### 4. Final Blocker: Unconfigurable Server Environment
+
+-   **Problem:** Even with a perfectly packaged application and a correct startup script, the Phusion Passenger process manager on the server fails to launch the application.
+-   **Evidence:** The final error is `Cannot lstat(".../app.js"): No such file or directory`.
+-   **Conclusion:** This error proves that the Plesk/Passenger environment is ignoring the "Application Startup File" setting provided in the UI and is hard-coded to look for a file named `app.js`. Renaming our script to `app.js` did not fix this, meaning the issue is a low-level server configuration problem.
 
 ---
 
-## Key Blockers
+## Final Recommendation
 
-- **Node.js is not available in the SSH shell or in the PATH for custom scripts.**
-- **Plesk/Passenger can run Node.js apps via the UI, but not via SSH or custom shell scripts unless Node.js is globally available.**
-- **The application process (Next.js) cannot start because the shell cannot find `node` to execute the server.**
-- **Missing or dummy environment variables (like `DATABASE_URL`) may also cause the app to crash, but the primary blocker is the missing Node.js binary.**
+The deployment is blocked by a server-side configuration issue that is beyond user-level control.
 
----
+**Action:** Contact the hosting provider's support team.
 
-## Next Steps
-
-- You must either:
-  - Contact your hosting provider or Plesk admin to enable Node.js in your shell environment, or
-  - Use only the Plesk UI for deployment and debugging, and ensure all required environment variables are set in the UI.
-
-- If you want to continue with Plesk UI only, you may need to:
-  - Use only supported startup files (like `node_modules/.bin/turbo` or `node_modules/.bin/next` if Plesk can find `node`).
-  - Ensure all runtime environment variables are set in the Plesk UI.
-  - Accept that SSH debugging is not possible on this host.
-
----
-
-## Summary
-
-The core blocker is that the Plesk/Passenger environment does not provide `node` in the PATH for custom scripts or SSH, so any attempt to start the app outside of the Plesk UI fails. All other issues (Clerk, API, database) are secondary to this fundamental environment limitation.
-
-You can now safely restart your context or revisit the deployment later with this summary as a reference.
+**Message to Support:**
+"My Node.js application fails to start. The Phusion Passenger log shows the error: `Could not spawn process for application ... Cannot lstat("/var/www/vhosts/.../app.js"): No such file or directory`. This error occurs even though the `app.js` file exists in the application root with the correct permissions, and the 'Application Startup File' in the Plesk UI is correctly set. Please investigate why Phusion Passenger cannot find or access the application startup file."
